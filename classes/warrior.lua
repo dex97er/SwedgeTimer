@@ -7,12 +7,11 @@ local LCG = LibStub("LibCustomGlow-1.0")
 
 
 local hs_ids = {
-    47450, 47449, 30324, 29707, 25286, 11567, 11566,
-    11565, 11564, 1608, 285, 284, 78
+     78
 }
 
 local cleave_ids = {
-    47520, 47519, 25231, 20569, 11609, 11608, 7369, 845
+    845
 }
 
 local bloodsurge_id = 46916
@@ -26,7 +25,7 @@ function ST.WARRIOR.on_rage_update(self)
     
     if self.hs_queued then
         local power = UnitPower("player")
-        local rage_cost = GetSpellPowerCost(47450)[1].cost
+        local rage_cost = GetSpellPowerCost(78)[1].cost
         if power < rage_cost then
             self.insufficient_rage = true
             self:set_bar_color("mainhand")
@@ -39,7 +38,7 @@ function ST.WARRIOR.on_rage_update(self)
 
     if self.cleave_queued then
         local power = UnitPower("player")
-        local rage_cost = GetSpellPowerCost(47520)[1].cost
+        local rage_cost = GetSpellPowerCost(845)[1].cost
         if power < rage_cost then
             self.insufficient_rage = true
             self:set_bar_color("mainhand")
