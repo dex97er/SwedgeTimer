@@ -1,21 +1,25 @@
 -- Get the name of a) this addon loaded seperately, or b) the addon that loaded this as an embedded library
 local loadedAddonName = ... 
-local MAJOR, MINOR = "LibClassicSwingTimerAPI", 20
+local MAJOR, MINOR = "LibClassicSwingTimerAPI", 28
 local lib = LibStub:NewLibrary(MAJOR, MINOR)
 if not lib then
 	return
 end
 
 local frame = CreateFrame("Frame")
+local tooltip_name = loadedAddonName .. "Tooltip"
+local tooltip = CreateFrame("GameTooltip", tooltip_name, nil, "GameTooltipTemplate")
+
 local C_Timer, tonumber = C_Timer, tonumber
-local GetSpellInfo, GetTime, CombatLogGetCurrentEventInfo = GetSpellInfo, GetTime, CombatLogGetCurrentEventInfo
+local GetSpellInfo, GetTime, CombatLogGetCurrentEventInfo, GetInventoryItemID = GetSpellInfo, GetTime, CombatLogGetCurrentEventInfo, GetInventoryItemID
 local UnitAttackSpeed, UnitAura, UnitGUID, UnitRangedDamage, GetPlayerInfoByGUID = UnitAttackSpeed, UnitAura, UnitGUID, UnitRangedDamage, GetPlayerInfoByGUID
 
 local isRetail = WOW_PROJECT_ID == WOW_PROJECT_MAINLINE
 local isClassic = WOW_PROJECT_ID == WOW_PROJECT_CLASSIC
 local isBCC = WOW_PROJECT_ID == WOW_PROJECT_BURNING_CRUSADE_CLASSIC and LE_EXPANSION_LEVEL_CURRENT == LE_EXPANSION_BURNING_CRUSADE
 local isWrath = WOW_PROJECT_ID == WOW_PROJECT_WRATH_CLASSIC and LE_EXPANSION_LEVEL_CURRENT == LE_EXPANSION_WRATH_OF_THE_LICH_KING
-local isClassicOrBCCOrWrath = isClassic or isBCC or isWrath
+local isCata = WOW_PROJECT_ID == WOW_PROJECT_CATACLYSM_CLASSIC and LE_EXPANSION_LEVEL_CURRENT == LE_EXPANSION_CATACLYSM
+local isClassicOrBCCOrWrathOrCata = isClassic or isBCC or isWrath or isCata
 
 local reset_swing_spells = nil
 local reset_swing_on_channel_stop_spells = nil
@@ -35,6 +39,8 @@ local Unit = {
 	mainSpeed = 0,
 	offSpeed = 0,
 	rangedSpeed = 0,
+	rangedBaseSpeed = 1,
+	autoShotCastTime = 0.52,
 
 	lastMainSwing = nil,
 	mainExpirationTime = nil,
@@ -46,6 +52,7 @@ local Unit = {
 
 	lastRangedSwing = nil,
 	rangedExpirationTime = nil,
+	firstRangedSwing = false,
 	feignDeathTimer = nil,
 
 	mainTimer = nil,
@@ -56,13 +63,14 @@ local Unit = {
 	casting = false,
 	channeling = false,
 	isAttacking = false,
+	isShooting = false,
 	preventSwingReset = false,
 	auraPreventSwingReset = false,
-	skipNextAttack = nil,
-	skipNextAttackCount = 0,
 
 	skipNextAttackSpeedUpdate = nil,
 	skipNextAttackSpeedUpdateCount = 0,
+
+	cache = {},
 }
 
 function Unit:new(obj)
@@ -137,9 +145,9 @@ function Unit:SwingStart(hand, startTime, isReset)
 		end
 		self.rangedSpeed = UnitRangedDamage("player") or 0
 		if self.rangedSpeed ~= nil and self.rangedSpeed > 0 then
-			self.rangedSpeed = self.rangedSpeed
 			self.lastRangedSwing = startTime
 			self.rangedExpirationTime = self.lastRangedSwing + self.rangedSpeed
+			self.autoShotCastTime = 0.52 * (self.rangedSpeed / self.rangedBaseSpeed)
 			self.callbacks:Fire("UNIT_SWING_TIMER_START", self.id, self.rangedSpeed, self.rangedExpirationTime, hand)
 			if self.rangedExpirationTime - GetTime() > 0 then
 				self.rangedTimer = C_Timer.NewTimer(self.rangedExpirationTime - GetTime(), function()
@@ -158,7 +166,7 @@ function Unit:SwingEnd(hand)
 	elseif hand == "ranged" and self.rangedTimer and not self.rangedTimer:IsCancelled() then
 		self.rangedTimer:Cancel()
 	end
-	if self.class == "DRUID" and self.skipNextAttackSpeedUpdate then
+	if (self.class == "DRUID" or self.class == "PALADIN") and self.skipNextAttackSpeedUpdate then
 		self.skipNextAttackSpeedUpdate = nil
 		lib:UNIT_ATTACK_SPEED('UNIT_ATTACK_SPEED', self.GUID)
 	end
@@ -168,11 +176,43 @@ function Unit:SwingEnd(hand)
 		if isRetail and hand == "mainhand" then		
 			self:SwingStart(hand, now, true)
 			self.callbacks:Fire("UNIT_SWING_TIMER_CLIPPED", self.id, hand)
-		elseif isClassicOrBCCOrWrath then
+		elseif isClassicOrBCCOrWrathOrCata then
 			self:SwingStart(hand, now, true)
 			self.callbacks:Fire("UNIT_SWING_TIMER_CLIPPED", self.id, hand)
 		end
 	end
+end
+
+function Unit:GetRangedBaseSpeed()
+	-- Default speed
+	local speed = 1
+	local weapon_id = GetInventoryItemID("player", INVSLOT_RANGED)
+
+	if self.cache[weapon_id] then
+		return self.cache[weapon_id]
+	elseif not weapon_id then
+		return speed
+	end
+
+	local font_string_base = tooltip_name .. "TextRight"
+	local speed_pattern = SPEED .. " (%d%.%d%d)"
+
+	tooltip:ClearLines()
+	tooltip:SetItemByID(weapon_id)
+	for i = 1, tooltip:NumLines() do
+		local fontString = _G[font_string_base .. i]
+		local text = fontString:GetText()
+		if text then
+			local match = text:match(speed_pattern)
+			if match then
+				speed = match
+				break
+			end
+		end
+	end
+
+	self.cache[weapon_id] = speed
+	return speed
 end
 
 lib.callbacks = lib.callbacks or LibStub("CallbackHandler-1.0"):New(lib)
@@ -244,6 +284,7 @@ function lib:PLAYER_ENTERING_WORLD()
 
 	self.player.lastRangedSwing = now
 	self.player.rangedExpirationTime = self.player.lastRangedSwing + self.player.rangedSpeed
+	self.player.firstRangedSwing = false
 	self.player.feignDeathTimer = nil
 
 	self.player.mainTimer = nil
@@ -256,8 +297,6 @@ function lib:PLAYER_ENTERING_WORLD()
 	self.player.isAttacking = false
 	self.player.preventSwingReset = false
 	self.player.auraPreventSwingReset = false
-	self.player.skipNextAttack = nil
-	self.player.skipNextAttackCount = 0
 
 	self.player.skipNextAttackSpeedUpdate = nil
 	self.player.skipNextAttackSpeedUpdateCount = 0
@@ -300,8 +339,6 @@ function lib:PLAYER_TARGET_CHANGED()
 	self.target.isAttacking = false
 	self.target.preventSwingReset = false
 	self.target.auraPreventSwingReset = false
-	self.target.skipNextAttack = nil
-	self.target.skipNextAttackCount = 0
 
 	self.target.skipNextAttackSpeedUpdate = nil
 	self.target.skipNextAttackSpeedUpdateCount = 0
@@ -313,36 +350,21 @@ end
 function lib:COMBAT_LOG_EVENT_UNFILTERED(_, ts, subEvent, _, sourceGUID, _, _, _, destGUID, _, _, _, amount, overkill, _, resisted, _, _, _, _, _, isOffHand)
 	local now = GetTime()
 	local unit = lib:getUnit(sourceGUID)
-	if subEvent == "SPELL_EXTRA_ATTACKS" and unit then
-		unit.skipNextAttack = ts
-		unit.skipNextAttackCount = resisted
-	elseif (subEvent == "SWING_DAMAGE" or subEvent == "SWING_MISSED") and unit then
+	if (subEvent == "SWING_DAMAGE" or subEvent == "SWING_MISSED") and unit then
 		local isOffHand = isOffHand
 		if subEvent == "SWING_MISSED" then
 			isOffHand = overkill
 		end
-		if
-			unit.skipNextAttack ~= nil
-			and tonumber(unit.skipNextAttack)
-			and (ts - unit.skipNextAttack) < 0.04
-			and tonumber(unit.skipNextAttackCount)
-			and not isOffHand
-		then
-			if unit.skipNextAttackCount > 0 then
-				unit.skipNextAttackCount = unit.skipNextAttackCount - 1
-				return false
-			end
-		end
 		if isOffHand then
 			unit.firstOffSwing = true
 			unit:SwingStart("offhand", now, false)
-			if isWrath then
+			if isWrath or isCata then
 				unit:SwingStart("ranged", now, true)
 			end
 		else
 			unit.firstMainSwing = true
 			unit:SwingStart("mainhand", now, false)
-			if isWrath then
+			if isWrath or isCata then
 				unit:SwingStart("ranged", now, true)
 			end
 		end
@@ -382,6 +404,20 @@ function lib:COMBAT_LOG_EVENT_UNFILTERED(_, ts, subEvent, _, sourceGUID, _, _, _
 				unit:SwingStart("ranged", GetTime(), true)
 			end
 		end
+	elseif subEvent == "SPELL_CAST_START" and unit then
+		local spell = amount
+		if isClassic and spell and ranged_swing[spell] then
+			if not unit.firstRangedSwing then
+				unit.firstRangedSwing = true
+				unit.rangedExpirationTime = now + unit.autoShotCastTime
+				unit.callbacks:Fire("UNIT_SWING_TIMER_UPDATE", unit.id, unit.rangedSpeed, unit.rangedExpirationTime, "ranged")
+				if unit.rangedExpirationTime - now > 0 then
+					unit.rangedTimer = C_Timer.NewTimer(unit.rangedExpirationTime - now, function()
+						unit:SwingEnd("ranged")
+					end)
+				end
+			end
+		end
 	end
 end
 
@@ -390,7 +426,6 @@ function lib:UNIT_ATTACK_SPEED(_, unitGUID)
 	if not unit then
 		return
 	end
-	if isClassic and unit.class == "PALADIN" then return end -- Ignore UNIT_ATTACK_SPEED on Classic for Paladin. Seal of the Crusader snapshot. No other dynamic speed change.
 	local now = GetTime()
 	if
 		unit.skipNextAttackSpeedUpdate
@@ -436,6 +471,22 @@ function lib:UNIT_ATTACK_SPEED(_, unitGUID)
 		if unit.offSpeed > 0 and unit.offExpirationTime - GetTime() > 0 then
 			unit.offTimer = C_Timer.NewTimer(unit.offExpirationTime - GetTime(), function()
 				unit:SwingEnd("offhand")
+			end)
+		end
+	end
+	local rangedSpeedNew = UnitRangedDamage("player") or 0
+	if rangedSpeedNew > 0 and unit.rangedSpeed > 0 and rangedSpeedNew ~= unit.rangedSpeed then
+		if unit.rangedTimer then
+			unit.rangedTimer:Cancel()
+		end
+		local multiplier = rangedSpeedNew / unit.rangedSpeed
+		local timeLeft = (unit.lastRangedSwing + unit.rangedSpeed - now) * multiplier
+		unit.rangedSpeed = rangedSpeedNew
+		unit.rangedExpirationTime = now + timeLeft
+		self.callbacks:Fire("UNIT_SWING_TIMER_UPDATE", unit.id, unit.rangedSpeed, unit.rangedExpirationTime, "ranged")
+		if unit.rangedSpeed > 0 and unit.rangedExpirationTime - GetTime() > 0 then
+			unit.rangedTimer = C_Timer.NewTimer(unit.rangedExpirationTime - GetTime(), function()
+				unit:SwingEnd("ranged")
 			end)
 		end
 	end
@@ -488,7 +539,7 @@ function lib:UNIT_SPELLCAST_SUCCEEDED(_, unitType, _, spell)
 	local now = GetTime()
 	if spell ~= nil and next_melee_spells[spell] then
 		unit:SwingStart("mainhand", now, false)
-		if isWrath then
+		if isWrath or isCata then
 			unit:SwingStart("ranged", now, true)
 		end
 	end
@@ -543,7 +594,7 @@ function lib:UNIT_SPELLCAST_SUCCEEDED(_, unitType, _, spell)
 			if enabled == 1 then -- Reset ranged swing when FD CD start
 				unit:SwingStart("mainhand", start, true)
 				unit:SwingStart("offhand", start, true)
-				if isClassicOrBCCOrWrath then
+				if isClassicOrBCCOrWrathOrCata then
 					unit:SwingStart("ranged", start, true)
 				end
 				if unit.feignDeathTimer then
@@ -616,8 +667,11 @@ function lib:PLAYER_EQUIPMENT_CHANGED(_, equipmentSlot)
 		local now = GetTime()
 		self.player:SwingStart("mainhand", now, true)
 		self.player:SwingStart("offhand", now, true)
-		if isClassicOrBCCOrWrath then
+		if isClassicOrBCCOrWrathOrCata then
 			self.player:SwingStart("ranged", now, true)
+		end
+		if isClassicOrBCCOrWrathOrCata and equipmentSlot == 18 then
+			self.player.rangedBaseSpeed = self.player:GetRangedBaseSpeed()
 		end
 	end
 end
@@ -639,16 +693,49 @@ function lib:PLAYER_LEAVE_COMBAT()
 	self.player.firstOffSwing = false
 end
 
+function lib:START_AUTOREPEAT_SPELL()
+	self.player.isShooting = true
+	self.player.rangedBaseSpeed = self.player:GetRangedBaseSpeed()
+	self.player.autoShotCastTime = 0.52 * (self.player.rangedSpeed / self.player.rangedBaseSpeed)
+end
+
+function lib:STOP_AUTOREPEAT_SPELL()
+	self.player.isShooting = false
+	self.player.firstRangedSwing = false
+end
+
+function lib:UNIT_SPELLCAST_FAILED_QUIET(_, unitType, _, spell)
+	local unit = lib:getUnit(unitType)
+	if not unit then
+		return
+	end
+	if isClassic and spell and ranged_swing[spell] and unit.isShooting then
+		if self.player.rangedTimer and not self.player.rangedTimer:IsCancelled() then
+			self.player.rangedTimer:Cancel()
+		end
+		self.player.rangedExpirationTime = GetTime() + 0.5 + self.player.autoShotCastTime
+		self.player.callbacks:Fire("UNIT_SWING_TIMER_UPDATE", self.player.id, self.player.rangedSpeed, self.player.rangedExpirationTime, "ranged")
+		if self.player.rangedExpirationTime - GetTime() > 0 then
+			self.player.rangedTimer = C_Timer.NewTimer(self.player.rangedExpirationTime - GetTime(), function()
+				self.player:SwingEnd("ranged")
+			end)
+		end
+	end
+end
+
 frame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
 frame:RegisterEvent("PLAYER_EQUIPMENT_CHANGED")
 frame:RegisterEvent("PLAYER_ENTER_COMBAT")
 frame:RegisterEvent("PLAYER_LEAVE_COMBAT")
 frame:RegisterEvent("PLAYER_ENTERING_WORLD")
 frame:RegisterEvent("PLAYER_TARGET_CHANGED")
+frame:RegisterEvent("START_AUTOREPEAT_SPELL")
+frame:RegisterEvent("STOP_AUTOREPEAT_SPELL")
 frame:RegisterUnitEvent("UNIT_ATTACK_SPEED", "player", "target")
 frame:RegisterUnitEvent("UNIT_SPELLCAST_START", "player", "target")
 frame:RegisterUnitEvent("UNIT_SPELLCAST_INTERRUPTED", "player", "target")
 frame:RegisterUnitEvent("UNIT_SPELLCAST_FAILED", "player", "target")
+frame:RegisterUnitEvent("UNIT_SPELLCAST_FAILED_QUIET", "player")
 frame:RegisterUnitEvent("UNIT_SPELLCAST_SUCCEEDED", "player", "target")
 frame:RegisterUnitEvent("UNIT_SPELLCAST_CHANNEL_START", "player", "target")
 frame:RegisterUnitEvent("UNIT_SPELLCAST_CHANNEL_STOP", "player", "target")
@@ -662,23 +749,37 @@ frame:SetScript("OnEvent", function(_, event, ...)
 	end
 end)
 
+tooltip:SetOwner(WorldFrame, "ANCHOR_NONE")
+
 --[[
-	Backward compatibility continue to fire EVENTS with SWING_TIMER_ format for player unit.
+	Specific event handling
 ]]--
-local EventBackwardCompatibility = function(event, ...)
+local EventHandler = function(event, ...)
+	-- Backward compatibility continue to fire EVENTS with SWING_TIMER_ format for player unit.
 	local unitId = select(1,...)
 	if unitId == "player" then
 		lib.callbacks:Fire(string.gsub(event,"UNIT_",""), select(2,...))
 	end
+	-- Fire EVENTS in Weakauras if the addon is loaded
+	if WeakAuras ~= nil then
+		WeakAuras.ScanEvents(event, select(1,...))
+	end
 end
 
-lib.RegisterCallback(lib, "UNIT_SWING_TIMER_INFO_INITIALIZED", EventBackwardCompatibility)
-lib.RegisterCallback(lib, "UNIT_SWING_TIMER_START", EventBackwardCompatibility)
-lib.RegisterCallback(lib, "UNIT_SWING_TIMER_UPDATE", EventBackwardCompatibility)
-lib.RegisterCallback(lib, "UNIT_SWING_TIMER_CLIPPED", EventBackwardCompatibility)
-lib.RegisterCallback(lib, "UNIT_SWING_TIMER_PAUSED", EventBackwardCompatibility)
-lib.RegisterCallback(lib, "UNIT_SWING_TIMER_STOP", EventBackwardCompatibility)
-lib.RegisterCallback(lib, "UNIT_SWING_TIMER_DELTA", EventBackwardCompatibility)
+lib.RegisterCallback(lib, "UNIT_SWING_TIMER_INFO_INITIALIZED", EventHandler)
+lib.RegisterCallback(lib, "UNIT_SWING_TIMER_START", EventHandler)
+lib.RegisterCallback(lib, "UNIT_SWING_TIMER_UPDATE", EventHandler)
+lib.RegisterCallback(lib, "UNIT_SWING_TIMER_CLIPPED", EventHandler)
+lib.RegisterCallback(lib, "UNIT_SWING_TIMER_PAUSED", EventHandler)
+lib.RegisterCallback(lib, "UNIT_SWING_TIMER_STOP", EventHandler)
+lib.RegisterCallback(lib, "UNIT_SWING_TIMER_DELTA", EventHandler)
+lib.RegisterCallback(lib, "SWING_TIMER_INFO_INITIALIZED", EventHandler)
+lib.RegisterCallback(lib, "SWING_TIMER_START", EventHandler)
+lib.RegisterCallback(lib, "SWING_TIMER_STOP",EventHandler)
+lib.RegisterCallback(lib, "SWING_TIMER_UPDATE", EventHandler)
+lib.RegisterCallback(lib, "SWING_TIMER_CLIPPED", EventHandler)
+lib.RegisterCallback(lib, "SWING_TIMER_DELTA", EventHandler)
+lib.RegisterCallback(lib, "SWING_TIMER_PAUSED", EventHandler)
 
 --[[
 	Set table data based on current game version
@@ -707,7 +808,6 @@ if isClassic then
 		[2908] = true, [8955] = true, [9901] = true, -- Soothe Animal
 		[467] = true, [782] = true, [1075] = true, [8914] = true, [9756] = true, [9910] = true, -- Thorns
 		[5176] = true, [5177] = true, [5178] = true, [5179] = true, [5180] = true, [6780] = true, [8905] = true, [9912] = true, -- Wrath
-		[407669] = true, -- Avenger's Shield
 	}
 
 	reset_swing_on_channel_stop_spells = {}
@@ -716,6 +816,12 @@ if isClassic then
 		[768] = true, -- Cat Form
 		[5487] = true, -- Bear Form
 		[9634] = true, -- Dire Bear Form
+		[21082] = true, -- Seal of the Crusader (Rank 1)
+		[20162] = true, -- Seal of the Crusader (Rank 2)
+		[20305] = true, -- Seal of the Crusader (Rank 3)
+		[20306] = true, -- Seal of the Crusader (Rank 4)
+		[20307] = true, -- Seal of the Crusader (Rank 5)
+		[20308] = true, -- Seal of the Crusader (Rank 6)
 	}
 
 	next_melee_spells = {
@@ -1082,6 +1188,106 @@ elseif isWrath then
 		[42245] = true, -- Volley (rank 3)
 		[42244] = true, -- Volley (rank 2)
 		[42243] = true,  -- Volley (rank 1)
+	}
+elseif isCata then
+	reset_swing_spells = {
+		-- need to verify following for Cataclysm
+		[16589] = true, -- Noggenfogger Elixir
+		[2645] = true, -- Ghost Wolf
+		[2764] = true, -- Throw
+		[3018] = true, -- Shoots,
+		[5019] = true, -- Shoot Wand
+		[75] = true, -- Auto Shot
+		[5185] = true, -- Hibernate
+		[2782] = true, -- Remove Corruption
+		[450759] = true, -- Revitalize
+		[50769] = true, -- Revive
+		[2908] = true, -- Soothe
+		[53563] = true, -- Beacon of Light
+		[64382] = true, -- Shattering Throw
+		[57755] = true, -- Heroic Throw
+
+		-- cata verified abilities below
+		[5384] = true, -- Feign Death
+		[339] = true, -- Entangling Roots
+		[770] = true, -- Faerie Fire
+		[33763] = true, -- Lifebloom
+		[1126] = true, -- Mark of the Wild
+		[8921] = true, -- Moonfire
+		[50464] = true, -- Nourish
+		[20484] = true, -- Regrowth
+		[774] = true, -- Rejuvenation
+		[467] = true, -- Thorns
+		[5176] = true, -- Wrath
+		[51505] = true, -- Lava Burst
+		[51533] = true, -- Feral Spirit
+	}
+
+	reset_swing_on_channel_stop_spells = {}
+
+	prevent_swing_speed_update = {
+		[768] = true, -- Cat Form
+		[5487] = true, -- Bear Form
+	}
+
+	-- all next melee spells have been converted to instants in Cataclysm
+	next_melee_spells = {}
+
+	-- need to verify these for Cataclysm
+	noreset_swing_spells = {
+		[23063] = true, -- Dense Dynamite
+		[4054] = true, -- Rough Dynamite
+		[4064] = true, -- Rough Copper Bomb
+		[4061] = true, -- Coarse Dynamite
+		[8331] = true, -- Ez-Thro Dynamite
+		[4065] = true, -- Large Copper Bomb
+		[4066] = true, -- Small Bronze Bomb
+		[4062] = true, -- Heavy Dynamite
+		[4067] = true, -- Big Bronze Bomb
+		[4068] = true, -- Iron Grenade
+		[23000] = true, -- Ez-Thro Dynamite II
+		[12421] = true, -- Mithril Frag Bomb
+		[4069] = true, -- Big Iron Bomb
+		[12562] = true, -- The Big One
+		[12543] = true, -- Hi-Explosive Bomb
+		[19769] = true, -- Thorium Grenade
+		[19784] = true, -- Dark Iron Bomb
+		[30216] = true, -- Fel Iron Bomb
+		[19821] = true, -- Arcane Bomb
+		[39965] = true, -- Frost Grenade
+		[30461] = true, -- The Bigger One
+		[30217] = true, -- Adamantite Grenade
+		[35476] = true, -- Drums of Battle
+		[35475] = true, -- Drums of War
+		[35477] = true, -- Drums of Speed
+		[35478] = true, -- Drums of Restoration
+		[19434] = true, -- Aimed Shot (rank 1)
+		[12051] = true, -- Evocation
+		--35474 Drums of Panic DO reset the swing timer, do not add
+
+		-- Below have been verified in Cataclysm
+		[56641] = true, -- Steady Shot
+		[1464] = true, -- Slam
+		[16914] = true, -- Hurricane
+	}
+
+	-- need to verify for cataclysm
+	prevent_reset_swing_auras = {
+		[53817] = true, -- Maelstrom Weapon
+	}
+
+	pause_swing_spells = {
+		[1464] = true, -- Slam
+	}
+
+	ranged_swing = {
+		[75] = true, -- Auto Shot
+		[3018] = true, -- Shoot
+		[2764] = true, -- Throw
+		[5019] = true, -- Shoot Wand
+	}
+
+	reset_ranged_swing = {
 	}
 elseif isRetail then
 	reset_swing_spells = {
